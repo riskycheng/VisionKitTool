@@ -61,68 +61,29 @@ class PersonSegmentationService: PersonSegmentationServiceProtocol {
         }
     }
     
-    /// 获取分割遮罩的详细信息
-    /// - Parameter mask: 分割遮罩的像素缓冲区
-    /// - Returns: 包含遮罩统计信息的字典
-    private func getMaskStatistics(from mask: CVPixelBuffer) -> [String: Any] {
-        // 锁定遮罩以便读取
-        CVPixelBufferLockBaseAddress(mask, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(mask, .readOnly) }
-        
-        guard let maskData = CVPixelBufferGetBaseAddress(mask) else {
-            return ["error": "无法访问遮罩数据"]
-        }
-        
-        let width = CVPixelBufferGetWidth(mask)
-        let height = CVPixelBufferGetHeight(mask)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(mask)
-        
-        var pixelCounts = [Int: Int]() // 值: 数量
-        var totalPixels = 0
-        var personPixels = 0
-        var backgroundPixels = 0
-        var edgePixels = 0
-        
-        // 分析遮罩中的像素值分布
-        for y in 0..<height {
-            for x in 0..<width {
-                let offset = y * bytesPerRow + x
-                let value = Int((maskData + offset).load(as: UInt8.self))
-                
-                pixelCounts[value, default: 0] += 1
-                totalPixels += 1
-                
-                if value < 64 {
-                    backgroundPixels += 1
-                } else if value > 192 {
-                    personPixels += 1
-                } else {
-                    edgePixels += 1
-                }
-            }
-        }
-        
-        // 找出最常见的前5个值
-        let topValues = pixelCounts.sorted { $0.value > $1.value }.prefix(5)
-        
-        return [
-            "dimensions": "\(width)x\(height)",
-            "totalPixels": totalPixels,
-            "personPixels": personPixels,
-            "personPercentage": Double(personPixels) / Double(totalPixels) * 100,
-            "backgroundPixels": backgroundPixels,
-            "backgroundPercentage": Double(backgroundPixels) / Double(totalPixels) * 100,
-            "edgePixels": edgePixels,
-            "edgePercentage": Double(edgePixels) / Double(totalPixels) * 100,
-            "topValues": topValues.map { "值\($0.key): \($0.value)像素 (\(Double($0.value) / Double(totalPixels) * 100)%)" }
-        ]
-    }
+
     
     /// Processes the person segmentation request
     /// - Parameter image: The source image containing a person
     /// - Returns: A new image with the person segmented (transparent background)
     private func processPersonSegmentation(_ image: UIImage) throws -> UIImage {
-        guard let cgImage = image.cgImage else {
+        // 保存原始图像的方向信息，以便后续使用
+        let originalOrientation = image.imageOrientation
+        
+        // 将图像转换为标准方向（up）以便 Vision 框架处理
+        // 这一步很重要，因为 Vision 框架在处理时可能会忽略方向信息
+        let normalizedImage: UIImage
+        if originalOrientation != .up {
+            if let cgImage = image.cgImage {
+                normalizedImage = UIImage(cgImage: cgImage, scale: image.scale, orientation: .up)
+            } else {
+                normalizedImage = image
+            }
+        } else {
+            normalizedImage = image
+        }
+        
+        guard let cgImage = normalizedImage.cgImage else {
             throw SegmentationError.invalidImage
         }
         
@@ -140,12 +101,17 @@ class PersonSegmentationService: PersonSegmentationServiceProtocol {
             throw SegmentationError.noSegmentationMask
         }
         
-        // 打印遮罩统计信息（可选，用于调试）
-        let maskStats = getMaskStatistics(from: mask)
-        print("人物分割遮罩统计信息: \(maskStats)")
+        // 移除统计信息收集，提高效率
         
-        // Create a transparent background image
-        return try createTransparentBackground(for: cgImage, using: mask)
+        // 创建透明背景图像
+        let segmentedImage = try createTransparentBackground(for: cgImage, using: mask)
+        
+        // 将分割后的图像还原为原始图像的方向
+        if let finalCGImage = segmentedImage.cgImage {
+            return UIImage(cgImage: finalCGImage, scale: image.scale, orientation: originalOrientation)
+        } else {
+            return segmentedImage
+        }
     }
     
     /// Creates a transparent background by applying the segmentation mask
@@ -154,14 +120,22 @@ class PersonSegmentationService: PersonSegmentationServiceProtocol {
     ///   - mask: The segmentation mask
     /// - Returns: An image with transparent background where the mask indicates
     private func createTransparentBackground(for image: CGImage, using mask: CVPixelBuffer) throws -> UIImage {
-        // Create a bitmap context with RGBA to support transparency
+        // 创建位图上下文，支持RGBA透明度
         let width = image.width
         let height = image.height
         let bytesPerPixel = 4
         let bytesPerRow = bytesPerPixel * width
         let bitsPerComponent = 8
         
-        guard let context = CGContext(data: nil,
+        // 创建上下文时直接分配内存，减少内存分配次数
+        let bufferSize = bytesPerRow * height
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+        defer { buffer.deallocate() } // 确保内存在函数结束时被释放
+        
+        // 初始化内存为0（完全透明）
+        buffer.initialize(repeating: 0, count: bufferSize)
+        
+        guard let context = CGContext(data: buffer,
                                       width: width,
                                       height: height,
                                       bitsPerComponent: bitsPerComponent,
@@ -171,9 +145,6 @@ class PersonSegmentationService: PersonSegmentationServiceProtocol {
             throw SegmentationError.graphicsContextCreationFailed
         }
         
-        // Clear the context to transparent - 创建一个完全透明的背景
-        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
-        
         // 获取原始图像的像素数据
         guard let originalImageProvider = image.dataProvider,
               let originalImageData = originalImageProvider.data,
@@ -181,74 +152,67 @@ class PersonSegmentationService: PersonSegmentationServiceProtocol {
             throw SegmentationError.invalidImage
         }
         
-        // Lock the mask for reading
+        // 锁定遮罩以便读取
         CVPixelBufferLockBaseAddress(mask, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(mask, .readOnly) }
         
-        // Get the mask data
+        // 获取遮罩数据
         guard let maskData = CVPixelBufferGetBaseAddress(mask) else {
             throw SegmentationError.maskDataAccessFailed
         }
         
-        // Get the context data
-        guard let contextData = context.data else {
-            throw SegmentationError.contextDataAccessFailed
-        }
-        
-        // Get mask properties
+        // 获取遮罩属性
         let maskWidth = CVPixelBufferGetWidth(mask)
         let maskHeight = CVPixelBufferGetHeight(mask)
         let maskBytesPerRow = CVPixelBufferGetBytesPerRow(mask)
         
-        // Calculate scaling factors if mask and image have different dimensions
+        // 计算缩放因子（如果遮罩和图像尺寸不同）
         let scaleX = Double(width) / Double(maskWidth)
         let scaleY = Double(height) / Double(maskHeight)
         
-        // 定义阈值常量，可以根据需要调整
-        let personThreshold: UInt8 = 128 // 人物阈值，大于此值的被视为人物
-        let edgeBlendFactor: Double = 1.5 // 边缘混合因子，用于平滑边缘
+        // 定义阈值常量
+        let personThreshold: UInt8 = 128 // 人物阈值
+        let highConfidenceThreshold: UInt8 = 220 // 高置信度阈值
+        let edgeBlendFactor: Double = 1.5 // 边缘混合因子
         
         // 获取原始图像的每像素字节数和每行字节数
         let originalBytesPerPixel = image.bitsPerPixel / 8
         let originalBytesPerRow = image.bytesPerRow
         
-        // 只复制那些被确定为人物的像素
-        for y in 0..<height {
+        // 使用并行处理提高效率
+        DispatchQueue.concurrentPerform(iterations: height) { y in
             for x in 0..<width {
-                // Calculate the corresponding position in the mask
+                // 计算遮罩中的对应位置
                 let maskX = Int(Double(x) / scaleX)
                 let maskY = Int(Double(y) / scaleY)
                 
-                // Ensure we're within mask bounds
+                // 确保在遮罩边界内
                 guard maskX >= 0 && maskX < maskWidth && maskY >= 0 && maskY < maskHeight else { continue }
                 
-                // Get the mask value (0-255, where 255 is person, 0 is background)
+                // 获取遮罩值（0-255，255表示人物，0表示背景）
                 let maskOffset = maskY * maskBytesPerRow + maskX
                 let maskValue = (maskData + maskOffset).load(as: UInt8.self)
                 
-                // 计算原始图像中的像素位置
-                let originalOffset = y * originalBytesPerRow + x * originalBytesPerPixel
-                
-                // 计算目标上下文中的像素位置
-                let contextOffset = y * bytesPerRow + x * bytesPerPixel
-                
+                // 只处理人物区域（阈值以上的像素）
                 if maskValue >= personThreshold {
-                    // 这是人物区域 - 从原始图像复制像素
-                    // 复制RGB通道
-                    for i in 0..<3 {
-                        let pixelValue = originalPixels[originalOffset + i]
-                        (contextData + contextOffset + i).storeBytes(of: pixelValue, as: UInt8.self)
+                    // 计算原始图像中的像素位置
+                    let originalOffset = y * originalBytesPerRow + x * originalBytesPerPixel
+                    
+                    // 计算目标上下文中的像素位置
+                    let contextOffset = y * bytesPerRow + x * bytesPerPixel
+                    
+                    // 复制RGB通道（一次性复制以提高效率）
+                    if originalBytesPerPixel >= 3 && bytesPerPixel >= 3 {
+                        memcpy(buffer + contextOffset, originalPixels + originalOffset, 3)
                     }
                     
                     // 设置Alpha通道
-                    if maskValue >= 220 {
+                    if maskValue >= highConfidenceThreshold {
                         // 完全是人物区域 - 完全不透明
-                        (contextData + contextOffset + 3).storeBytes(of: UInt8(255), as: UInt8.self)
+                        buffer[contextOffset + 3] = 255
                     } else {
                         // 边缘区域 - 应用平滑过渡
-                        // 计算透明度：将128-220的值映射到0-255
-                        let alpha = min(255, UInt8(Double(maskValue - personThreshold) * edgeBlendFactor))
-                        (contextData + contextOffset + 3).storeBytes(of: alpha, as: UInt8.self)
+                        buffer[contextOffset + 3] = min(255, UInt8(Double(maskValue - personThreshold) * edgeBlendFactor))
                     }
                 }
                 // 如果maskValue < personThreshold，保持完全透明（背景区域）
@@ -260,9 +224,9 @@ class PersonSegmentationService: PersonSegmentationServiceProtocol {
             throw SegmentationError.resultImageCreationFailed
         }
         
-        // Create a UIImage with the same orientation as the original
-        let originalUIImage = UIImage(cgImage: image)
-        return UIImage(cgImage: resultCGImage, scale: originalUIImage.scale, orientation: originalUIImage.imageOrientation)
+        // 创建最终结果图像，使用标准方向（up）
+        // 在processPersonSegmentation方法中会将其还原为原始图像的方向
+        return UIImage(cgImage: resultCGImage, scale: 1.0, orientation: .up)
     }
     
 
