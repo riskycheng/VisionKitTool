@@ -110,6 +110,9 @@ class PersonSegmentationService: PersonSegmentationServiceProtocol {
             throw SegmentationError.graphicsContextCreationFailed
         }
         
+        // Clear the context to transparent
+        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+        
         // Draw the original image
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
         
@@ -166,6 +169,8 @@ class PersonSegmentationService: PersonSegmentationServiceProtocol {
             throw SegmentationError.resultImageCreationFailed
         }
         
-        return UIImage(cgImage: resultCGImage)
+        // Create a UIImage with the same orientation as the original
+        let originalUIImage = UIImage(cgImage: image)
+        return UIImage(cgImage: resultCGImage, scale: originalUIImage.scale, orientation: originalUIImage.imageOrientation)
     }
 }
