@@ -7,6 +7,7 @@
 
 import SwiftUI
 
+/// Main application entry point
 @main
 struct VisionKitToolApp: App {
     var body: some Scene {
